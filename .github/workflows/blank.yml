@@ -1,12 +1,7 @@
-from pathlib import Path
-
-content = r'''name: Titan Cloud PC - Mobile RDP + Tailscale
+name: PC Virtual Windows - KZ
 
 on:
   workflow_dispatch:
-
-permissions:
-  contents: read
 
 jobs:
   windows-pc:
@@ -14,115 +9,214 @@ jobs:
     timeout-minutes: 350
 
     steps:
-      - name: Prepare Windows, RDP account and Tailscale
+
+      # ==============================
+      # 1. CONFIGURAÇÃO DO WINDOWS
+      # ==============================
+      - name: Configurar Windows
         shell: powershell
-        env:
-          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
-          $ErrorActionPreference = "Stop"
+          Write-Host "Configurando PC virtual..."
 
-          Write-Host "=== Titan Cloud PC starting ==="
-
-          # Validate required secrets before making changes.
-          if ([string]::IsNullOrWhiteSpace($env:TS_AUTHKEY)) {
-            throw "Missing TS_AUTHKEY. Add it in Repository Settings > Secrets and variables > Actions."
-          }
-
-          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
-            throw "Missing RDP_PASSWORD. Add a strong password in Repository Settings > Secrets and variables > Actions."
-          }
-
-          if ($env:RDP_PASSWORD.Length -lt 12) {
-            throw "RDP_PASSWORD must be at least 12 characters long."
-          }
-
-          # Create or update the dedicated RDP user.
-          $username = "CloudUser"
-          $securePassword = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
-          $existingUser = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
-
-          if ($existingUser) {
-            Set-LocalUser -Name $username -Password $securePassword
-            Enable-LocalUser -Name $username
-            Write-Host "Updated existing RDP account."
-          } else {
-            New-LocalUser -Name $username `
-              -Password $securePassword `
-              -Description "Titan Cloud PC remote desktop account" `
-              -PasswordNeverExpires
-            Write-Host "Created RDP account."
-          }
-
-          # Grant standard Remote Desktop access; do not make this user an administrator.
-          $rdpGroup = Get-LocalGroup -SID "S-1-5-32-555"
-          Add-LocalGroupMember -Group $rdpGroup.Name -Member $username -ErrorAction SilentlyContinue
-
-          # Enable Remote Desktop and the built-in firewall rules.
+          # Ativar Remote Desktop
           Set-ItemProperty `
-            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" `
-            -Name "fDenyTSConnections" -Value 0
+            -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
+            -Name "fDenyTSConnections" `
+            -Value 0
 
+          # Permitir conexões RDP
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
 
-          # Download and install Tailscale.
-          $installer = Join-Path $env:TEMP "tailscale-setup.exe"
-          Write-Host "Downloading Tailscale..."
+          # Habilitar Network Level Authentication
+          Set-ItemProperty `
+            -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
+            -Name "UserAuthentication" `
+            -Value 1
+
+          Write-Host "RDP configurado."
+
+      # ==============================
+      # 2. CRIAR USUÁRIO RDP
+      # ==============================
+      - name: Criar usuário do PC
+        shell: powershell
+        run: |
+          $Username = "KZPC"
+          $Password = "KzPC@2026!Virtual"
+
+          $SecurePassword = ConvertTo-SecureString `
+            $Password `
+            -AsPlainText `
+            -Force
+
+          if (-not (Get-LocalUser -Name $Username -ErrorAction SilentlyContinue)) {
+              New-LocalUser `
+                -Name $Username `
+                -Password $SecurePassword `
+                -FullName "KZ Virtual PC" `
+                -Description "Usuário do PC virtual"
+          }
+
+          Add-LocalGroupMember `
+            -Group "Administrators" `
+            -Member $Username `
+            -ErrorAction SilentlyContinue
+
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member $Username `
+            -ErrorAction SilentlyContinue
+
+          Write-Host "Usuário criado:"
+          Write-Host "Usuário: $Username"
+          Write-Host "Senha: $Password"
+
+      # ==============================
+      # 3. INSTALAR TAILSCALE
+      # ==============================
+      - name: Instalar Tailscale
+        shell: powershell
+        run: |
+          Write-Host "Baixando Tailscale..."
+
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $installer = "$env:TEMP\tailscale.msi"
+
           Invoke-WebRequest `
-            -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe" `
+            -Uri $url `
             -OutFile $installer
 
-          Write-Host "Installing Tailscale..."
-          $install = Start-Process -FilePath $installer -ArgumentList "/quiet" -Wait -PassThru
-          if ($install.ExitCode -ne 0) {
-            throw "Tailscale installer returned exit code $($install.ExitCode)."
+          Start-Process `
+            msiexec.exe `
+            -ArgumentList "/i `"$installer`" /quiet /norestart" `
+            -Wait
+
+          Write-Host "Tailscale instalado."
+
+      # ==============================
+      # 4. CONECTAR TAILSCALE
+      # ==============================
+      - name: Conectar Tailscale
+        shell: powershell
+        env:
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          $tailscale = "C:\Program Files\Tailscale\tailscale.exe"
+
+          if (!(Test-Path $tailscale)) {
+              Write-Host "Tailscale não encontrado."
+              exit 1
           }
 
-          $tailscaleExe = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
-          if (!(Test-Path $tailscaleExe)) {
-            throw "Tailscale executable was not found after installation."
-          }
+          & $tailscale up `
+            --authkey="$env:TS_AUTHKEY" `
+            --hostname="KZ-Virtual-PC"
 
-          # Authenticate this temporary runner to the user's tailnet.
-          # Use a one-off/ephemeral key where supported, and never print the key.
-          Write-Host "Connecting to Tailscale..."
-          & $tailscaleExe up "--auth-key=$env:TS_AUTHKEY" "--hostname=titan-cloud-pc"
-          if ($LASTEXITCODE -ne 0) {
-            throw "Tailscale connection failed. Check TS_AUTHKEY, key expiry, and tailnet policy."
-          }
-
-          Start-Sleep -Seconds 8
-
-          $ip = (& $tailscaleExe ip -4 | Select-Object -First 1).Trim()
-          if ([string]::IsNullOrWhiteSpace($ip)) {
-            throw "No Tailscale IPv4 address was returned."
-          }
-
-          # Confirm the Remote Desktop service is running.
-          Set-Service -Name TermService -StartupType Manual
-          Start-Service -Name TermService
-          $service = Get-Service -Name TermService
-          if ($service.Status -ne "Running") {
-            throw "Remote Desktop Services is not running."
-          }
+          Start-Sleep -Seconds 10
 
           Write-Host ""
-          Write-Host "========== TITAN CLOUD PC READY =========="
-          Write-Host "PC name      : titan-cloud-pc"
-          Write-Host "Tailscale IP : $ip"
-          Write-Host "RDP username : $username"
-          Write-Host "RDP port     : 3389"
-          Write-Host "RDP password : use your RDP_PASSWORD secret"
-          Write-Host "=========================================="
-          Write-Host "On the phone, connect Tailscale to the same authorized tailnet first."
-          Write-Host "Then open a compatible RDP client and enter the IP, username and password."
-          Write-Host "Do not share logs or secrets publicly."
+          Write-Host "===== TAILSCALE ====="
 
-          # Keep the temporary GitHub-hosted runner active until timeout.
+          & $tailscale status
+
+          Write-Host ""
+          Write-Host "===== IP TAILSCALE ====="
+
+          & $tailscale ip -4
+
+      # ==============================
+      # 5. INSTALAR PROGRAMAS BÁSICOS
+      # ==============================
+      - name: Instalar programas
+        shell: powershell
+        run: |
+          Write-Host "Instalando programas..."
+
+          winget install `
+            --id 7zip.7zip `
+            --silent `
+            --accept-package-agreements `
+            --accept-source-agreements `
+            --disable-interactivity `
+            -e
+
+          Write-Host "Programas instalados."
+
+      # ==============================
+      # 6. MOSTRAR INFORMAÇÕES DO PC
+      # ==============================
+      - name: Mostrar informações
+        shell: powershell
+        run: |
+          Write-Host ""
+          Write-Host "================================"
+          Write-Host "       KZ VIRTUAL PC"
+          Write-Host "================================"
+          Write-Host ""
+
+          Write-Host "Computador:"
+          Get-CimInstance Win32_ComputerSystem |
+            Select-Object Manufacturer, Model, TotalPhysicalMemory
+
+          Write-Host ""
+          Write-Host "Processador:"
+          Get-CimInstance Win32_Processor |
+            Select-Object Name, NumberOfCores, NumberOfLogicalProcessors
+
+          Write-Host ""
+          Write-Host "Memória:"
+          Get-CimInstance Win32_OperatingSystem |
+            Select-Object `
+              @{Name="RAM_GB";Expression={[math]::Round($_.TotalVisibleMemorySize/1MB,2)}}
+
+          Write-Host ""
+          Write-Host "Disco:"
+          Get-PSDrive C |
+            Select-Object `
+              @{Name="Total_GB";Expression={[math]::Round(($_.Used + $_.Free)/1GB,2)}},
+              @{Name="Livre_GB";Expression={[math]::Round($_.Free/1GB,2)}}
+
+      # ==============================
+      # 7. MOSTRAR IP DO TAILSCALE
+      # ==============================
+      - name: Mostrar IP para Windows App
+        shell: powershell
+        run: |
+          $tailscale = "C:\Program Files\Tailscale\tailscale.exe"
+
+          Write-Host ""
+          Write-Host "======================================"
+          Write-Host "      DADOS PARA WINDOWS APP"
+          Write-Host "======================================"
+          Write-Host ""
+
+          Write-Host "IP Tailscale:"
+          & $tailscale ip -4
+
+          Write-Host ""
+          Write-Host "Usuário: KZPC"
+          Write-Host "Senha: KzPC@2026!Virtual"
+
+          Write-Host ""
+          Write-Host "No Windows App use o IP acima."
+          Write-Host "======================================"
+
+      # ==============================
+      # 8. MANTER O PC RODANDO
+      # ==============================
+      - name: Manter PC virtual ligado
+        shell: powershell
+        run: |
+          Write-Host ""
+          Write-Host "======================================"
+          Write-Host "       PC VIRTUAL ESTÁ ONLINE"
+          Write-Host "======================================"
+          Write-Host ""
+
           while ($true) {
-            Start-Sleep -Seconds 60
+              $time = Get-Date -Format "HH:mm:ss"
+
+              Write-Host "PC online - $time"
+
+              Start-Sleep -Seconds 60
           }
-'''
-p = Path("/mnt/data/Titan-Cloud-PC-Mobile.txt")
-p.write_text(content, encoding="utf-8")
-print(f"Arquivo TXT completo criado: {p}")
